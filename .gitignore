@@ -1,0 +1,7 @@
+__pycache__/
+anki_cli.egg-info/
+anki_state.json
+media/
+uv.lock
+*.apkg
+*.swp
