@@ -41,13 +41,26 @@ def fit(text: str, width: int) -> str:
     return text[:width].ljust(width)
 
 
+BODY_PADDING = 2
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def visible_len(text: str) -> int:
+    return len(ANSI_RE.sub("", text))
+
+
 def wrap_body(text: str, cols: int) -> list[str]:
+    pad = " " * BODY_PADDING
+    usable = cols - BODY_PADDING
     out: list[str] = []
     for line in text.splitlines():
-        if len(line) <= cols:
-            out.append(line)
+        if visible_len(line) <= usable:
+            out.append(pad + line)
         else:
-            out.extend(textwrap.wrap(line, cols, break_long_words=True) or [""])
+            out.extend(
+                pad + w
+                for w in (textwrap.wrap(line, usable, break_long_words=True) or [""])
+            )
     return out
 
 
@@ -96,9 +109,15 @@ def strip_html(text: str) -> str:
     return text.strip()
 
 
+BOLD = "\033[1m"
+UNDERLINE = "\033[4m"
+RESET = "\033[0m"
+DIM = "\033[2m"
+
+
 def resolve_cloze(text: str, ordinal: int, reveal: bool) -> str:
     """Resolve cloze deletions. When reveal=False, replace the target cloze with [...].
-    When reveal=True, show the answer. Non-target clozes are always revealed."""
+    When reveal=True, show the answer highlighted. Non-target clozes are always revealed."""
     target = ordinal + 1
 
     def replacer(m: re.Match[str]) -> str:
@@ -107,8 +126,8 @@ def resolve_cloze(text: str, ordinal: int, reveal: bool) -> str:
         hint = m.group(3)
         if cloze_num == target:
             if reveal:
-                return f"[{answer}]"
-            return f"[{hint or '...'}]"
+                return f"{BOLD}{UNDERLINE}[{answer}]{RESET}"
+            return f"{BOLD}[{hint or '...'}]{RESET}"
         return answer
 
     return re.sub(r"\{\{c(\d+)::([^}]*?)(?:::([^}]*?))?\}\}", replacer, text)
@@ -331,6 +350,29 @@ def sm2_update(card: dict, quality: int) -> None:
         card["due"] = str(date.today() + timedelta(days=card["interval"]))
 
 
+def format_interval(days: int) -> str:
+    if days == 0:
+        return "<1d"
+    if days < 30:
+        return f"{days}d"
+    if days < 365:
+        months = days / 30.4
+        return f"{months:.1f}mo"
+    years = days / 365.25
+    return f"{years:.1f}y"
+
+
+def preview_intervals(card: dict) -> str:
+    """Show what each grade would give as the next interval."""
+    labels = []
+    for quality, name in enumerate(["Again", "Hard", "Good", "Easy"]):
+        c = dict(card)
+        sm2_update(c, quality)
+        interval = c["interval"]
+        labels.append(f"({quality + 1}) {name}: {format_interval(interval)}")
+    return "  ".join(labels)
+
+
 DEFAULT_SESSION_SIZE = 25
 
 
@@ -357,6 +399,27 @@ def pick_session_size(due_count: int) -> int | None:
             buf += k
 
 
+def pick_uniform(due_by_deck: dict[str, list[str]], total: int) -> list[str]:
+    """Pick up to `total` cards, spreading evenly across decks."""
+    for keys in due_by_deck.values():
+        shuffle(keys)
+    remaining = {d: list(keys) for d, keys in due_by_deck.items() if keys}
+    picked: list[str] = []
+    while remaining and len(picked) < total:
+        per_deck = max(1, (total - len(picked)) // len(remaining))
+        exhausted: list[str] = []
+        for d, keys in remaining.items():
+            take = min(per_deck, len(keys), total - len(picked))
+            picked.extend(keys[:take])
+            del keys[:take]
+            if not keys:
+                exhausted.append(d)
+        for d in exhausted:
+            del remaining[d]
+    shuffle(picked)
+    return picked
+
+
 def review(state: dict, deck_id: str | None = None) -> None:
     today = str(date.today())
 
@@ -365,7 +428,6 @@ def review(state: dict, deck_id: str | None = None) -> None:
         for k, c in state["cards"].items()
         if c["due"] <= today and (deck_id is None or c["deck_id"] == deck_id)
     ]
-    shuffle(due_keys)
 
     if not due_keys:
         draw_review(" Review", "\n  No cards due!", " [any key] Back")
@@ -375,7 +437,16 @@ def review(state: dict, deck_id: str | None = None) -> None:
     session_size = pick_session_size(len(due_keys))
     if session_size is None:
         return
-    due_keys = due_keys[:session_size]
+
+    if deck_id is not None:
+        shuffle(due_keys)
+        due_keys = due_keys[:session_size]
+    else:
+        due_by_deck: dict[str, list[str]] = {}
+        for k in due_keys:
+            d = state["cards"][k]["deck_id"]
+            due_by_deck.setdefault(d, []).append(k)
+        due_keys = pick_uniform(due_by_deck, session_size)
 
     total = len(due_keys)
 
@@ -385,12 +456,13 @@ def review(state: dict, deck_id: str | None = None) -> None:
         header = f" {deck_name}  —  Card {i}/{total}"
 
         front, front_sounds = render_card(card, "front")
+        front_body = f"\n{DIM}Question{RESET}\n\n{front}"
         footer = (
             " [Space] Reveal  [r] Replay  [q] Quit"
             if front_sounds
             else " [Space] Reveal  [q] Quit"
         )
-        draw_review(header, f"\n{front}", footer)
+        draw_review(header, front_body, footer)
         play_sounds(front_sounds)
 
         while True:
@@ -403,12 +475,12 @@ def review(state: dict, deck_id: str | None = None) -> None:
             if k == " ":
                 break
 
+        _, cols = term_size()
+        separator = f"\n{'─' * (cols - BODY_PADDING * 2)}\n"
         back, back_sounds = render_card(card, "back")
-        draw_review(
-            header,
-            f"\n{back}",
-            " (1) Again  (2) Hard  (3) Good  (4) Easy  [q] Quit",
-        )
+        back_body = f"\n{DIM}Question{RESET}\n\n{front}{separator}\n{DIM}Answer{RESET}\n\n{back}"
+        intervals = preview_intervals(card)
+        draw_review(header, back_body, f" {intervals}  [q] Quit")
         play_sounds(back_sounds)
 
         while True:
