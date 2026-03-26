@@ -16,6 +16,10 @@ from html import unescape
 from pathlib import Path
 from random import shuffle
 
+from xml.etree import ElementTree
+
+from PIL import Image, ImageDraw
+
 
 def read_key() -> str:
     fd = sys.stdin.fileno()
@@ -68,6 +72,7 @@ def draw_review(
     header: str,
     body: str,
     footer: str,
+    image: Image.Image | None = None,
 ) -> None:
     rows, cols = term_size()
     clear_screen()
@@ -75,9 +80,12 @@ def draw_review(
     sys.stdout.write(f"\033[7m{fit(header, cols)}\033[0m\n")
 
     body_lines = wrap_body(body, cols)
-    available = rows - 3
-    for line in body_lines[:available]:
+    for line in body_lines[: rows - 3]:
         sys.stdout.write(line + "\n")
+
+    if image is not None:
+        sys.stdout.flush()
+        display_image(image)
 
     sys.stdout.write(f"\033[{rows};0H")
     sys.stdout.write(f"\033[7m{fit(footer, cols)}\033[0m")
@@ -92,6 +100,136 @@ INITIAL_EASE = 2.5
 MIN_EASE = 1.3
 GRADUATING_INTERVAL = 1
 EASY_INTERVAL = 4
+
+IMG_SRC_RE = re.compile(r'<img[^>]+src="([^"]+)"', re.IGNORECASE)
+
+
+def extract_images(html: str) -> list[str]:
+    return IMG_SRC_RE.findall(html)
+
+
+def _find_icat() -> str | None:
+    import shutil
+
+    return shutil.which("kitten") or shutil.which("icat")
+
+
+def parse_color(color: str) -> tuple[int, int, int, int]:
+    color = color.strip()
+    if color.startswith("#"):
+        h = color[1:]
+        if len(h) == 3:
+            h = h[0] * 2 + h[1] * 2 + h[2] * 2
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+    return (0, 0, 0, 255)
+
+
+SVG_NS = "{http://www.w3.org/2000/svg}"
+
+
+def render_svg_rects(path: Path) -> Image.Image | None:
+    """Rasterize an Image Occlusion SVG (contains only rect elements)."""
+    try:
+        tree = ElementTree.parse(path)
+    except ElementTree.ParseError:
+        return None
+    root = tree.getroot()
+    w = int(float(root.get("width", "0")))
+    h = int(float(root.get("height", "0")))
+    if w == 0 or h == 0:
+        return None
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    for rect in root.iter(f"{SVG_NS}rect"):
+        x = float(rect.get("x", "0"))
+        y = float(rect.get("y", "0"))
+        rw = float(rect.get("width", "0"))
+        rh = float(rect.get("height", "0"))
+        fill = rect.get("fill", "#000000")
+        stroke = rect.get("stroke")
+        box = (x, y, x + rw, y + rh)
+        draw.rectangle(box, fill=parse_color(fill))
+        if stroke:
+            draw.rectangle(box, outline=parse_color(stroke), width=2)
+    return img
+
+
+def load_image(filename: str) -> Image.Image | None:
+    path = MEDIA_DIR / filename
+    if not path.exists():
+        return None
+    if path.suffix.lower() == ".svg":
+        return render_svg_rects(path)
+    try:
+        return Image.open(path).convert("RGBA")
+    except Exception:
+        return None
+
+
+def composite_with_mask(base_img: Image.Image, mask_img: Image.Image) -> Image.Image:
+    if mask_img.size != base_img.size:
+        mask_img = mask_img.resize(base_img.size, Image.Resampling.LANCZOS)
+    result = base_img.copy()
+    result.alpha_composite(mask_img)
+    return result
+
+
+def display_image(img: Image.Image) -> None:
+    """Display image inline using kitten icat."""
+    icat = _find_icat()
+    if icat is None:
+        return
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        img.save(f, format="PNG")
+        tmp_path = f.name
+    try:
+        cmd = [icat, "icat"] if icat.endswith("kitten") else [icat]
+        cmd += ["--align", "left", "--stdin", "no", tmp_path]
+        subprocess.run(cmd, timeout=5)
+    except Exception:
+        pass
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def render_images_for_card(fields: dict[str, str], side: str) -> Image.Image | None:
+    """Build composite image for image-occlusion or plain image cards."""
+    base_src = None
+    mask_src = None
+
+    img_field = fields.get("Image", "")
+    if img_field:
+        srcs = extract_images(img_field)
+        if srcs:
+            base_src = srcs[0]
+
+    if base_src:
+        mask_field_name = "Question Mask" if side == "front" else "Answer Mask"
+        mask_html = fields.get(mask_field_name, "")
+        mask_srcs = extract_images(mask_html)
+        if mask_srcs:
+            mask_src = mask_srcs[0]
+
+    if base_src is None:
+        all_srcs: list[str] = []
+        for v in fields.values():
+            all_srcs.extend(extract_images(v))
+        if all_srcs:
+            base_src = all_srcs[0]
+
+    if base_src is None:
+        return None
+
+    base_img = load_image(base_src)
+    if base_img is None:
+        return None
+
+    if mask_src:
+        mask_img = load_image(mask_src)
+        if mask_img:
+            return composite_with_mask(base_img, mask_img)
+
+    return base_img
 
 
 def strip_html(text: str) -> str:
@@ -270,23 +408,35 @@ def sync_decks() -> dict:
     return state
 
 
+def field_has_content(html: str) -> bool:
+    if strip_html(html).strip():
+        return True
+    return bool(IMG_SRC_RE.search(html))
+
+
+COND_POS_RE = re.compile(r"\{\{#(.+?)\}\}(.*?)\{\{/\1\}\}", re.DOTALL)
+COND_NEG_RE = re.compile(r"\{\{\^(.+?)\}\}(.*?)\{\{/\1\}\}", re.DOTALL)
+
+
 def render_template(template: str, fields: dict[str, str]) -> str:
     """Process Anki Mustache-like templates: conditionals and field substitution."""
     text = template
-    # {{#Field}}...{{/Field}} — show block if field non-empty
-    text = re.sub(
-        r"\{\{#(.+?)\}\}(.*?)\{\{/\1\}\}",
-        lambda m: m.group(2) if strip_html(fields.get(m.group(1), "")).strip() else "",
-        text,
-        flags=re.DOTALL,
-    )
-    # {{^Field}}...{{/Field}} — show block if field empty
-    text = re.sub(
-        r"\{\{\^(.+?)\}\}(.*?)\{\{/\1\}\}",
-        lambda m: "" if strip_html(fields.get(m.group(1), "")).strip() else m.group(2),
-        text,
-        flags=re.DOTALL,
-    )
+    for _ in range(10):
+        new = COND_POS_RE.sub(
+            lambda m: (
+                m.group(2) if field_has_content(fields.get(m.group(1), "")) else ""
+            ),
+            text,
+        )
+        new = COND_NEG_RE.sub(
+            lambda m: (
+                "" if field_has_content(fields.get(m.group(1), "")) else m.group(2)
+            ),
+            new,
+        )
+        if new == text:
+            break
+        text = new
 
     def replacer(m: re.Match[str]) -> str:
         name = m.group(1)
@@ -300,7 +450,7 @@ def render_template(template: str, fields: dict[str, str]) -> str:
     return re.sub(r"\{\{([^#/^}]+?)\}\}", replacer, text)
 
 
-def render_card(card: dict, side: str) -> tuple[str, list[str]]:
+def render_card(card: dict, side: str) -> tuple[str, list[str], Image.Image | None]:
     tmpl = card["template_front"] if side == "front" else card["template_back"]
     text = render_template(tmpl, card["fields"])
 
@@ -308,13 +458,16 @@ def render_card(card: dict, side: str) -> tuple[str, list[str]]:
         text = resolve_cloze(text, card["cloze_ord"], reveal=(side == "back"))
 
     text = re.sub(r"\{\{FrontSide\}\}", "", text)
+
+    img = render_images_for_card(card["fields"], side)
+
     text = strip_html(text)
     sounds = re.findall(r"\[sound:([^\]]+)\]", text)
     text = re.sub(r"\[sound:[^\]]+\]", "", text)
     lines = [line.strip() for line in text.splitlines()]
     text = "\n".join(lines)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip(), sounds
+    return text.strip(), sounds, img
 
 
 def play_sounds(sounds: list[str]) -> None:
@@ -455,14 +608,14 @@ def review(state: dict, deck_id: str | None = None) -> None:
         deck_name = state["decks"].get(card["deck_id"], "?")
         header = f" {deck_name}  —  Card {i}/{total}"
 
-        front, front_sounds = render_card(card, "front")
+        front, front_sounds, front_img = render_card(card, "front")
         front_body = f"\n{DIM}Question{RESET}\n\n{front}"
         footer = (
             " [Space] Reveal  [r] Replay  [q] Quit"
             if front_sounds
             else " [Space] Reveal  [q] Quit"
         )
-        draw_review(header, front_body, footer)
+        draw_review(header, front_body, footer, image=front_img)
         play_sounds(front_sounds)
 
         while True:
@@ -477,10 +630,10 @@ def review(state: dict, deck_id: str | None = None) -> None:
 
         _, cols = term_size()
         separator = f"\n{'─' * (cols - BODY_PADDING * 2)}\n"
-        back, back_sounds = render_card(card, "back")
+        back, back_sounds, back_img = render_card(card, "back")
         back_body = f"\n{DIM}Question{RESET}\n\n{front}{separator}\n{DIM}Answer{RESET}\n\n{back}"
         intervals = preview_intervals(card)
-        draw_review(header, back_body, f" {intervals}  [q] Quit")
+        draw_review(header, back_body, f" {intervals}  [q] Quit", image=back_img)
         play_sounds(back_sounds)
 
         while True:
