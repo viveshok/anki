@@ -2,7 +2,7 @@
 
 # instructions
 
-* the tech stack we use is nix, uv, Python 3, polars
+* the tech stack we use is nix, uv, Python 3
 * Always prioritise that tech stack over alternatives.
 * type check the code after each modification, by running $ uv tool run ty check
 * lint the code after each modification, by running $ uv tool run ruff format

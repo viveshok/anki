@@ -94,6 +94,7 @@ def draw_review(
 
 STATE_FILE = Path("anki_state.json")
 MEDIA_DIR = Path("media")
+DECKS_DIR = Path("decks")
 
 # SM-2 defaults
 INITIAL_EASE = 2.5
@@ -392,12 +393,12 @@ def sync_decks() -> dict:
     state = load_state()
     state.setdefault("files", {})
 
-    apkg_files = {p.name for p in Path(".").glob("*.apkg")}
+    apkg_files = {p.name for p in DECKS_DIR.glob("*.apkg")}
     known_files = set(state["files"].keys())
 
     for filename in sorted(apkg_files - known_files):
         print(f"Importing {filename}...")
-        imported = import_apkg(Path(filename), state)
+        imported = import_apkg(DECKS_DIR / filename, state)
         print(f"  {imported} new cards.")
 
     for filename in sorted(known_files - apkg_files):
@@ -471,11 +472,12 @@ def render_card(card: dict, side: str) -> tuple[str, list[str], Image.Image | No
 
 
 def play_sounds(sounds: list[str]) -> None:
+    player = "afplay" if sys.platform == "darwin" else "mpv"
     for filename in sounds:
         path = MEDIA_DIR / filename
         if path.exists():
             subprocess.Popen(
-                ["afplay", str(path)],
+                [player, str(path)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -698,7 +700,7 @@ def main_menu() -> None:
     state = sync_decks()
 
     if not state["decks"]:
-        print("No .apkg files found in current directory.")
+        print("No .apkg files found in decks/ directory.")
         return
 
     sorted_decks = sorted(state["decks"].items(), key=lambda x: x[1])
